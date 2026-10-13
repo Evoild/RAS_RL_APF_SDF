@@ -1,0 +1,46 @@
+{
+  "profile": "static-obstacle-stage1",
+  "environment": {
+    "task": "static_obstacle",
+    "num_obstacles": 1,
+    "obstacle_radius": 0.03,
+    "success_threshold": 0.02,
+    "distance_reward_scale": 1.0,
+    "success_reward": 100.0,
+    "timeout_penalty": -10.0,
+    "proximity_margin": 0.08,
+    "proximity_penalty_scale": 2.0,
+    "collision_penalty": -20.0,
+    "terminate_on_collision": true,
+    "path_offset_range": 0.08,
+    "min_safety_dist": 0.08,
+    "obstacle_obs_noise_std": 0.001,
+    "obstacle_disturb_prob": 0.0,
+    "obstacle_disturb_step": 0.02,
+    "joint_step_deg": 3.0,
+    "medium_joint_step_deg": 1.0,
+    "near_joint_step_deg": 0.5,
+    "medium_step_distance": 0.1,
+    "near_step_distance": 0.03,
+    "adaptive_joint_step": false,
+    "ee_goal_observation": true,
+    "obstacle_relative_observation": true,
+    "max_steps": 300,
+    "randomize_reset": false
+  },
+  "ppo": {
+    "policy_lr": 0.0002,
+    "value_lr": 0.0002,
+    "train_epochs": 10,
+    "target_kl": 0.02,
+    "separate_grad_clip": false
+  },
+  "training": {
+    "total_steps": 4000000,
+    "rollout_steps": 2048,
+    "eval_every_steps": 100000,
+    "eval_episodes": 100,
+    "seed": 17,
+    "init_checkpoint": "checkpoints_ppo/total-steps_4000000_rollout-steps_2048_success-threshold_0.02_joint-steps-deg_3-1-0.5_step-distances_0.1-0.03_joint-step-mode_fixed_grad-clip_shared_observation_ee-goal-16d_policy-lr_0.0002_epochs_10_target-kl_0.02_seed_17/best_success.pt"
+  }
+}

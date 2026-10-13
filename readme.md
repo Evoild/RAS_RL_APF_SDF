@@ -220,33 +220,16 @@ Actor、Critic 和 `log_std` 使用同一个 Adam optimizer，但 Actor 与 Crit
 在 `rl/` 目录运行：
 
 ```bash
-python3 scripts/ppo/train_ppo.py \
-  --total-steps 4000000 \
-  --rollout-steps 2048 \
-  --policy-lr 0.0002 \
-  --value-lr 0.0002 \
-  --train-epochs 10 \
-  --target-kl 0.02 \
-  --eval-every-steps 100000 \
-  --eval-episodes 100 \
-  --num-obstacles 0 \
-  --success-threshold 0.02 \
-  --max-steps 300 \
-  --joint-step-deg 3 \
-  --ee-goal-observation \
-  --seed 17
+./scripts/train.sh
 ```
 
-不要为 baseline 添加以下参数：
+该脚本固定读取 `configs/ppo/reaching_baseline.json`。仍可在命令后追加参数做临时覆盖，例如：
 
-```text
---adaptive-joint-step
---separate-grad-clip
---randomize-reset
---no-ee-goal-observation
+```bash
+./scripts/train.sh --total-steps 100000 --no-tensorboard
 ```
 
-训练默认不渲染、不录制视频。模型选择以训练内 deterministic evaluation 的 success rate 为第一优先级，相同成功率下再比较 mean return。推荐使用 `best_success.pt`，不要直接用 `final.pt`。
+训练默认不渲染、不录制视频。模型选择以训练内 deterministic evaluation 的 success rate 为第一优先级，相同成功率下再比较 mean return。推荐使用 `best_success.pt`，不要直接用 `final.pt`。每次运行的 `metrics.csv`、`metrics.jsonl` 和解析后的 `config.json` 独立保存在 `logs_ppo/runs/<run_name>/`，不再覆盖其他实验。
 
 ## 9. Baseline Checkpoint
 
@@ -384,28 +367,13 @@ logs_ppo/result_test/<checkpoint-run>/summary.csv
 ### 12.2 独立评估
 
 ```bash
-RUN=total-steps_4000000_rollout-steps_2048_success-threshold_0.02_joint-steps-deg_3-1-0.5_step-distances_0.1-0.03_joint-step-mode_fixed_grad-clip_shared_observation_ee-goal-16d_policy-lr_0.0002_epochs_10_target-kl_0.02_seed_17
-
-python3 scripts/ppo/evaluate_policy.py \
-  --checkpoint "checkpoints_ppo/$RUN/best_success.pt" \
-  --episodes 100 \
-  --mode both \
-  --success-threshold 0.02 \
-  --max-steps 300 \
-  --joint-step-deg 3 \
-  --ee-goal-observation
+./scripts/eval.sh
 ```
 
 ### 12.3 可视化
 
 ```bash
-python3 scripts/ppo/visualize_policy.py \
-  --checkpoint "checkpoints_ppo/$RUN/best_success.pt" \
-  --episodes 3 \
-  --success-threshold 0.02 \
-  --max-steps 300 \
-  --joint-step-deg 3 \
-  --ee-goal-observation
+./scripts/visualize.sh
 ```
 
 默认使用 deterministic policy；增加 `--stochastic` 可观察采样动作。
@@ -436,12 +404,91 @@ eval/det_success_rate
 eval/stoch_success_rate
 ```
 
-## 14. 下一阶段
+## 14. 静态障碍阶段
+
+静态障碍和无障碍 baseline 共用同一个 `train_ppo.py`，通过独立 profile 和 shell 入口隔离：
+
+```text
+configs/ppo/reaching_baseline.json
+configs/ppo/static_obstacle_stage1.json
+
+scripts/train.sh
+scripts/eval.sh
+scripts/visualize.sh
+
+scripts/train_obstacle.sh
+scripts/eval_obstacle.sh
+scripts/visualize_obstacle.sh
+```
+
+第一阶段静态障碍配置：
+
+```text
+num_obstacles = 1
+obstacle_radius = 0.03 m
+obstacle_disturb_prob = 0
+min_safety_dist = 0.08 m
+proximity_margin = 0.08 m
+proximity_penalty_scale = 2
+collision_penalty = -20
+terminate_on_collision = true
+observation_dim = 22
+```
+
+22 维观测为：
+
+```text
+qpos[7]
+goal[3]
+ee_pos[3]
+goal-ee_pos[3]
+obstacle_pos[3]
+obstacle_pos-ee_pos[3]
+```
+
+障碍物在每次 reset 时沿起点到目标路径附近重新采样，在一个 episode 内保持静止。当前只支持一个参与真实 MuJoCo 碰撞的球形障碍物。
+
+静态障碍训练从已验证的 16 维 reaching `best_success.pt` 初始化。Actor/Critic 第一层的前 16 列复制旧权重，新增 6 列清零，其他层和 `log_std` 完整复制，因此初始化时保留原 reaching 行为：
+
+```bash
+./scripts/train_obstacle.sh
+```
+
+训练结束后运行：
+
+```bash
+./scripts/eval_obstacle.sh
+./scripts/visualize_obstacle.sh
+```
+
+如果训练目录带有 `_run-002` 等后缀，通过环境变量指定 checkpoint：
+
+```bash
+CHECKPOINT=checkpoints_ppo/<run>/best_success.pt ./scripts/eval_obstacle.sh
+CHECKPOINT=checkpoints_ppo/<run>/best_success.pt ./scripts/visualize_obstacle.sh
+```
+
+正式结果测试：
+
+```bash
+python3 scripts/ppo/test_obstacle_policy.py \
+  --config configs/ppo/static_obstacle_stage1.json \
+  --checkpoint checkpoints_ppo/<run>/best_success.pt \
+  --episodes 100 \
+  --seeds 10017 10018 10019 20017 \
+  --mode both
+```
+
+障碍阶段模型选择以 deterministic `collision_free_success_rate` 为第一指标。测试同时记录普通成功率、整条 episode 任意碰撞率、障碍碰撞率、超时率、最小 clearance、回报和动作饱和率。
+
+`min_obstacle_distance` 使用 MuJoCo `mj_geomDistance`，计算 23 个实际参与碰撞的机器人 geom 到球形障碍表面的精确最小距离，不再使用关节锚点近似。
+
+## 15. 下一阶段
 
 1. 将当前 `best_success.pt` 固定为无障碍 2 cm reaching baseline。
-2. 增加 checkpoint resume 与配置校验，再以 1 cm 阈值进行课程微调。
-3. 完成 1 cm/5 mm 精度对照后，逐步加入弱障碍和障碍接近惩罚。
+2. 运行静态弱障碍 stage 1，先观察 collision-free success、碰撞率和最小 clearance。
+3. 根据 stage 1 结果单独调整接近惩罚、碰撞惩罚或障碍半径，避免同时改变多个变量。
 4. 增加目标、障碍和初始状态随机化，并使用多个训练 seed 报告均值与方差。
 5. pure RL obstacle avoidance 稳定后，再加入 APF shaping 或 action prior 做严格对照。
 
-当前所有成功率仅代表 `num_obstacles=0` 的 reaching，不代表已经具备避障能力。
+当前已有正式结果仍只代表 `num_obstacles=0` 的 reaching；静态障碍代码已完成冒烟验证，但尚未产生正式长训练结果。

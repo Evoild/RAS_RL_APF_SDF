@@ -57,6 +57,8 @@ class PandaObstacleEnv:
         collision_margin: float = 0.01,
         terminate_on_collision: bool = False,
         proximity_margin: float = 0.05,
+        proximity_penalty_scale: float = 0.0,
+        collision_penalty: float = 0.0,
         path_offset_range: float = 0.08,
         min_safety_dist: float = 0.3,
         obstacle_disturb_prob: float = 0.0,
@@ -68,6 +70,7 @@ class PandaObstacleEnv:
         near_step_distance: float = DEFAULT_NEAR_STEP_DISTANCE,
         adaptive_joint_step: bool = True,
         include_ee_goal_observation: bool = False,
+        include_obstacle_relative_observation: bool = False,
         max_steps: int = 300,
         frame_skip: int = 10,
         seed: int | None = None,
@@ -95,6 +98,8 @@ class PandaObstacleEnv:
         self.collision_margin = float(collision_margin)
         self.terminate_on_collision = bool(terminate_on_collision)
         self.proximity_margin = float(proximity_margin)
+        self.proximity_penalty_scale = float(proximity_penalty_scale)
+        self.collision_penalty = float(collision_penalty)
         self.path_offset_range = float(path_offset_range)
         self.min_safety_dist = float(min_safety_dist)
         self.obstacle_disturb_prob = float(obstacle_disturb_prob)
@@ -106,6 +111,13 @@ class PandaObstacleEnv:
         self.near_step_distance = float(near_step_distance)
         self.adaptive_joint_step = bool(adaptive_joint_step)
         self.include_ee_goal_observation = bool(include_ee_goal_observation)
+        self.include_obstacle_relative_observation = bool(include_obstacle_relative_observation)
+        if not np.isfinite(self.proximity_margin) or self.proximity_margin <= 0.0:
+            raise ValueError("proximity_margin must be a finite positive value")
+        if not np.isfinite(self.proximity_penalty_scale) or self.proximity_penalty_scale < 0.0:
+            raise ValueError("proximity_penalty_scale must be finite and non-negative")
+        if not np.isfinite(self.collision_penalty) or self.collision_penalty > 0.0:
+            raise ValueError("collision_penalty must be finite and non-positive")
         joint_steps = (self.near_joint_step, self.medium_joint_step, self.max_joint_step)
         if not all(np.isfinite(step) and step > 0.0 for step in joint_steps):
             raise ValueError("joint step sizes must be finite positive values")
@@ -137,6 +149,15 @@ class PandaObstacleEnv:
                 "right_finger",
             ]
         )
+        self.robot_collision_geom_ids = [
+            geom_id
+            for geom_id in range(self.model.ngeom)
+            if int(self.model.geom_bodyid[geom_id]) in self.robot_body_ids
+            and (
+                int(self.model.geom_contype[geom_id]) != 0
+                or int(self.model.geom_conaffinity[geom_id]) != 0
+            )
+        ]
 
         self.arm_joints = 7
         self.controlled_joints = 7
@@ -158,8 +179,9 @@ class PandaObstacleEnv:
             shape=(self.controlled_joints,),
             dtype=np.float32,
         )
-        # Optional EE position and goal-relative vector expose reaching geometry directly.
-        obs_dim = self.controlled_joints + 3 + (6 if self.include_ee_goal_observation else 0) + self.num_obstacles * 3
+        # Optional relative vectors expose reaching and obstacle geometry directly.
+        obstacle_features = self.num_obstacles * (6 if self.include_obstacle_relative_observation else 3)
+        obs_dim = self.controlled_joints + 3 + (6 if self.include_ee_goal_observation else 0) + obstacle_features
         self.observation_space = ContinuousBoxSpace(
             low=np.full(obs_dim, -np.inf, dtype=np.float32),
             high=np.full(obs_dim, np.inf, dtype=np.float32),
@@ -256,15 +278,23 @@ class PandaObstacleEnv:
         self.step_count += 1
         self._disturb_obstacles()
         ee_pos = self._ee_pos()
-        distance_reward, distance_to_goal, min_obstacle_distance, collision_info = self._reward(ee_pos)
+        (
+            distance_reward,
+            proximity_penalty,
+            distance_to_goal,
+            min_obstacle_distance,
+            collision_info,
+        ) = self._reward(ee_pos)
 
         collision = collision_info["collision"]
         success = distance_to_goal < self.success_threshold and not collision
-        timeout = self.step_count >= self.max_steps and not success
+        collision_termination = collision and self.terminate_on_collision
+        timeout = self.step_count >= self.max_steps and not success and not collision_termination
         done = bool(success or (collision and self.terminate_on_collision) or timeout)
         reward_success = self.success_reward if success else 0.0
         timeout_penalty = self.timeout_penalty if timeout else 0.0
-        reward = distance_reward + reward_success + timeout_penalty
+        collision_penalty = self.collision_penalty if collision else 0.0
+        reward = distance_reward + reward_success + timeout_penalty + proximity_penalty + collision_penalty
         obs = self._get_obs()
         info = {
             "success": success,
@@ -278,6 +308,9 @@ class PandaObstacleEnv:
             "distance_reward": distance_reward,
             "reward_success": reward_success,
             "timeout_penalty": timeout_penalty,
+            "proximity_penalty": proximity_penalty,
+            "collision_penalty": collision_penalty,
+            "collision_free_success": bool(success),
             "effective_joint_step_deg": float(np.rad2deg(self.effective_joint_step)),
             "ground_collision": collision_info["ground_collision"],
             "self_collision": collision_info["self_collision"],
@@ -398,32 +431,38 @@ class PandaObstacleEnv:
                 rgba=rgba,
             )
 
-    # 网络输入包含关节角、目标位置、可选的末端/相对目标位置和障碍物位置。
+    # 网络输入包含关节角、目标位置、可选的末端/目标相对向量及障碍物几何。
     def _get_obs(self) -> np.ndarray:
         obstacle_noise = self.rng.normal(0.0, self.obstacle_obs_noise_std, size=self.obstacles.shape)
-        noisy_obstacles = (self.obstacles + obstacle_noise).reshape(-1)
+        noisy_obstacles = self.obstacles + obstacle_noise
         parts = [self.data.qpos[: self.controlled_joints], self.goal]
         if self.include_ee_goal_observation:
             ee_pos = self._ee_pos()
             parts.extend((ee_pos, self.goal - ee_pos))
-        parts.append(noisy_obstacles)
+        parts.append(noisy_obstacles.reshape(-1))
+        if self.include_obstacle_relative_observation:
+            parts.append((noisy_obstacles - self._ee_pos()[None, :]).reshape(-1))
         obs = np.concatenate(parts)
 
         if obs.shape != self.observation_space.shape:
             raise RuntimeError(f"Observation shape drifted to {obs.shape}, expected {self.observation_space.shape}")
         return obs.astype(np.float32)
 
-    # 第一阶段只使用稠密距离奖励；成功奖励和超时惩罚在 step 中按终止状态追加。
+    # Reaching 稠密奖励和可选避障塑形；成功、碰撞和超时终止奖励在 step 中追加。
     def _reward(
         self,
         ee_pos: np.ndarray,
-    ) -> tuple[float, float, float, dict[str, bool]]:
+    ) -> tuple[float, float, float, float, dict[str, bool]]:
         distance_to_goal = float(np.linalg.norm(ee_pos - self.goal))
-        joint_obstacle_distances = self._min_joint_static_obstacle_distances()
-        min_obstacle_distance = float(np.min(joint_obstacle_distances))
+        robot_obstacle_distances = self._robot_static_obstacle_clearances()
+        min_obstacle_distance = float(np.min(robot_obstacle_distances))
         collision_info = self._collision_info(ee_pos, min_obstacle_distance)
         distance_reward = -self.distance_reward_scale * distance_to_goal
-        return distance_reward, distance_to_goal, min_obstacle_distance, collision_info
+        proximity_penalty = 0.0
+        if self.num_obstacles > 0 and min_obstacle_distance < self.proximity_margin:
+            normalized_proximity = (self.proximity_margin - min_obstacle_distance) / self.proximity_margin
+            proximity_penalty = -self.proximity_penalty_scale * normalized_proximity**2
+        return distance_reward, proximity_penalty, distance_to_goal, min_obstacle_distance, collision_info
 
     def _select_joint_step(self) -> float:
         if not self.adaptive_joint_step:
@@ -447,26 +486,28 @@ class PandaObstacleEnv:
     def _ee_pos(self) -> np.ndarray:
         return self.data.site_xpos[self.ee_site_id].copy()
 
-    def _min_joint_static_obstacle_distances(self) -> np.ndarray:
+    def _robot_static_obstacle_clearances(self) -> np.ndarray:
         if self.num_obstacles == 0:
-            return np.full(self.controlled_joints, np.inf, dtype=np.float64)
+            return np.array([np.inf], dtype=np.float64)
 
-        joint_positions = self.data.xanchor[np.asarray(self.controlled_joint_ids, dtype=np.int32)]
-        sphere_distances = np.linalg.norm(joint_positions[:, None, :] - self.obstacles[None, :, :], axis=2)
-        sphere_clearances = np.maximum(sphere_distances - self.obstacle_radius, 0.0)
-
-        clearances = [np.min(sphere_clearances, axis=1)]
-        for geom_id in self.platform_geom_ids:
-            geom_pos = self.data.geom_xpos[geom_id]
-            geom_radius = float(np.linalg.norm(self.model.geom_size[geom_id]))
-            platform_clearance = np.maximum(np.linalg.norm(joint_positions - geom_pos, axis=1) - geom_radius, 0.0)
-            clearances.append(platform_clearance)
-        return np.min(np.vstack(clearances), axis=0)
+        clearances = []
+        for geom_id in self.robot_collision_geom_ids:
+            fromto = np.zeros(6, dtype=np.float64)
+            clearance = mujoco.mj_geomDistance(
+                self.model,
+                self.data,
+                geom_id,
+                self.obstacle_geom_id,
+                10.0,
+                fromto,
+            )
+            clearances.append(float(clearance))
+        return np.asarray(clearances, dtype=np.float64)
 
     def _collision_info(self, ee_pos: np.ndarray, min_obstacle_distance: float) -> dict[str, bool]:
         ground_collision = bool(ee_pos[2] < 0.05)
         obstacle_collision = bool(
-            self.num_obstacles > 0 and min_obstacle_distance < self.collision_margin + self.obstacle_radius
+            self.num_obstacles > 0 and min_obstacle_distance < self.collision_margin
         )
         self_collision = False
 

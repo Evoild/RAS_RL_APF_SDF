@@ -15,11 +15,8 @@ if [[ ! -f "${CHECKPOINT}" ]]; then
 fi
 
 python3 scripts/ppo/evaluate_policy.py \
+  --config configs/ppo/reaching_baseline.json \
   --checkpoint "${CHECKPOINT}" \
   --episodes 100 \
   --mode both \
-  --success-threshold 0.02 \
-  --max-steps 300 \
-  --joint-step-deg 3 \
-  --ee-goal-observation \
   "$@"

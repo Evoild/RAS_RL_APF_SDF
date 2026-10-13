@@ -312,3 +312,48 @@ joint_step_mode = fixed, 3 deg
 ### 验证与结果
 
 语法检查、16 维与旧 10 维 checkpoint 加载、两阈值双模式冒烟测试、CSV 行数和字段检查均通过。100 episode deterministic 正式验证：2 cm `96/100`（95% 区间约 `[90.2%, 98.4%]`）、1 cm `71/100`（约 `[61.5%, 79.0%]`）、5 mm `23/100`（约 `[15.8%, 32.2%]`），与第8次手工复评一致。各阈值单独执行仿真并改变成功终止判定，不能当作同一轨迹的重新标注。
+
+## 第10次改进
+
+### 改进目的
+
+在保留无障碍 reaching baseline 的同时，引入可独立复现的单静态障碍训练阶段，避免复制并维护两套 PPO 训练器，并保证训练、评估和可视化使用同一环境配置。
+
+### 改进内容
+
+- 新增 `configs/ppo/reaching_baseline.json` 和 `configs/ppo/static_obstacle_stage1.json`，分别固定无障碍 baseline 与单静态障碍配置。
+- 新增 `scripts/ppo/common.py`，统一 JSON profile 解析、CLI 覆盖、环境构造、观测维度命名和配置快照；训练参数与评估参数按 section 隔离。
+- 保留 `train.sh`、`eval.sh`、`visualize.sh` 作为无障碍入口；新增对应的三个 obstacle shell 入口。
+- 静态障碍观测由 16 维扩展到 22 维，追加障碍物世界坐标和 `obstacle_pos-ee_pos`。
+- 环境奖励新增二次接近惩罚与碰撞惩罚，并支持碰撞立即终止；无障碍 profile 将两项尺度设为零，保持原三项奖励。
+- 障碍物每次 reset 沿路径附近重新采样，episode 内不扰动；将静态阶段 `min_safety_dist` 从不适合当前路径长度的 0.3 m 调整为 0.08 m。
+- 修正 clearance 已减球半径后碰撞阈值又重复加入半径的问题；改用 MuJoCo `mj_geomDistance` 计算 23 个机器人碰撞 geom 到球形障碍表面的精确最小距离，不再混入工作台距离或使用关节锚点近似。
+- PPO 增加 16→22 维初始化迁移：Actor/Critic 第一层前 16 列复制，新增 6 列清零，其余参数必须严格同形。
+- 训练日志改为 `logs_ppo/runs/<run_name>/` 独立目录并保存 `config.json`；静态障碍模型按 deterministic `collision_free_success_rate` 选择。
+- 新增 `test_obstacle_policy.py`，输出无碰撞成功率及 Wilson 区间、碰撞率、超时率、最小 clearance、回报和动作饱和率。
+
+### 关键配置
+
+```text
+task = static_obstacle
+num_obstacles = 1
+obstacle_radius = 0.03 m
+obstacle_disturb_prob = 0
+min_safety_dist = 0.08 m
+observation_dim = 22
+proximity_margin = 0.08 m
+proximity_penalty_scale = 2
+collision_penalty = -20
+terminate_on_collision = true
+init_checkpoint = reaching 16d best_success.pt
+```
+
+### 验证与结果
+
+Python 编译、JSON 解析、shell 语法和 `git diff --check` 均通过。使用项目 `mujoco` Conda 环境完成无障碍与静态障碍各 32-step CPU 端到端训练：baseline 正确使用 16 维网络且新增奖励均为零；静态障碍正确使用 22 维网络，并完成旧 checkpoint 的 16→22 维迁移。两条训练均生成隔离的 checkpoint、metrics 和配置快照。
+
+数值测试确认迁移前后的 deterministic action 和 value 在相同前 16 维输入下保持一致；22 维相对障碍向量满足 `obstacle_pos-ee_pos`；障碍位置在 episode 内不变；总奖励等于各分量之和；强制零 clearance 时接近惩罚为 `-2` 且正确识别障碍碰撞。旧 16 维 baseline checkpoint 仍可被重构后的评估入口严格加载。
+
+静态障碍评估和结果测试各完成 1 episode 冒烟，正确输出 `collision_free_success_rate`、`any_collision_rate` 和 `mean_min_clearance`。本次尚无正式静态障碍长训练结果；下一步运行 `./scripts/train_obstacle.sh` 后再分析奖励尺度和避障效果。
+
+精确 clearance 修改后再次完成 32-step 静态障碍训练，CPU 速度约为 80 step/s。连续 200 次 reset 采样中没有初始碰撞或起终点安全距离违规，最小初始障碍表面 clearance 约为 1.72 cm。

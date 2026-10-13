@@ -112,6 +112,8 @@ class PPOAgent:
     ) -> None:
         self.config = config
         self.device = torch.device(device)
+        self.obs_dim = int(obs_dim)
+        self.action_dim = int(action_dim)
         self.model = ActorCritic(
             obs_dim,
             action_dim,
@@ -262,8 +264,55 @@ class PPOAgent:
         return (dist.log_prob(raw_action) - correction).sum(dim=-1)
 
     def save(self, path: str) -> None:
-        torch.save({"model": self.model.state_dict(), "config": self.config.__dict__}, path)
+        torch.save(
+            {
+                "model": self.model.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+                "config": self.config.__dict__,
+                "obs_dim": self.obs_dim,
+                "action_dim": self.action_dim,
+            },
+            path,
+        )
 
     def load(self, path: str) -> None:
         checkpoint = torch.load(path, map_location=self.device)
         self.model.load_state_dict(checkpoint["model"])
+
+    def initialize_from(self, path: str) -> dict[str, int]:
+        """Initialize a larger-observation policy while preserving learned behavior."""
+        checkpoint = torch.load(path, map_location=self.device)
+        source_state = checkpoint["model"]
+        target_state = self.model.state_dict()
+        expandable = {"actor_mean.0.weight", "critic.0.weight"}
+        source_obs_dim = None
+
+        for name, target in target_state.items():
+            if name not in source_state:
+                raise ValueError(f"Initialization checkpoint is missing parameter: {name}")
+            source = source_state[name]
+            if source.shape == target.shape:
+                target_state[name] = source
+                continue
+            if (
+                name in expandable
+                and source.ndim == 2
+                and target.ndim == 2
+                and source.shape[0] == target.shape[0]
+                and source.shape[1] < target.shape[1]
+            ):
+                expanded = torch.zeros_like(target)
+                expanded[:, : source.shape[1]] = source
+                target_state[name] = expanded
+                source_obs_dim = int(source.shape[1])
+                continue
+            raise ValueError(
+                f"Cannot initialize parameter {name}: checkpoint {tuple(source.shape)} "
+                f"!= model {tuple(target.shape)}"
+            )
+
+        self.model.load_state_dict(target_state)
+        return {
+            "source_obs_dim": source_obs_dim if source_obs_dim is not None else self.obs_dim,
+            "target_obs_dim": self.obs_dim,
+        }

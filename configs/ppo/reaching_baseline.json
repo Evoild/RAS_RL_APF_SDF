@@ -1,0 +1,45 @@
+{
+  "profile": "reaching-baseline",
+  "environment": {
+    "task": "reaching",
+    "num_obstacles": 0,
+    "obstacle_radius": 0.04,
+    "success_threshold": 0.02,
+    "distance_reward_scale": 1.0,
+    "success_reward": 100.0,
+    "timeout_penalty": -10.0,
+    "proximity_margin": 0.05,
+    "proximity_penalty_scale": 0.0,
+    "collision_penalty": 0.0,
+    "terminate_on_collision": false,
+    "path_offset_range": 0.08,
+    "min_safety_dist": 0.3,
+    "obstacle_obs_noise_std": 0.001,
+    "obstacle_disturb_prob": 0.0,
+    "obstacle_disturb_step": 0.02,
+    "joint_step_deg": 3.0,
+    "medium_joint_step_deg": 1.0,
+    "near_joint_step_deg": 0.5,
+    "medium_step_distance": 0.1,
+    "near_step_distance": 0.03,
+    "adaptive_joint_step": false,
+    "ee_goal_observation": true,
+    "obstacle_relative_observation": false,
+    "max_steps": 300,
+    "randomize_reset": false
+  },
+  "ppo": {
+    "policy_lr": 0.0002,
+    "value_lr": 0.0002,
+    "train_epochs": 10,
+    "target_kl": 0.02,
+    "separate_grad_clip": false
+  },
+  "training": {
+    "total_steps": 4000000,
+    "rollout_steps": 2048,
+    "eval_every_steps": 100000,
+    "eval_episodes": 100,
+    "seed": 17
+  }
+}

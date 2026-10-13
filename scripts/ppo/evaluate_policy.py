@@ -10,83 +10,65 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from algorithms import PPOAgent, PPOConfig
-from envs import (
-    DEFAULT_JOINT_STEP_DEG,
-    DEFAULT_MEDIUM_JOINT_STEP_DEG,
-    DEFAULT_MEDIUM_STEP_DISTANCE,
-    DEFAULT_NEAR_JOINT_STEP_DEG,
-    DEFAULT_NEAR_STEP_DISTANCE,
-    DEFAULT_SUCCESS_THRESHOLD,
-    PandaObstacleEnv,
-)
+from common import add_config_argument, add_environment_arguments, make_env, parse_args_with_config
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate a seven-joint Panda reaching PPO policy.")
+    parser = argparse.ArgumentParser(description="Evaluate a Panda PPO policy with a reproducible task profile.")
+    add_config_argument(parser)
     parser.add_argument("--checkpoint", type=Path, default=Path("checkpoints_ppo/best_success.pt"))
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--success-threshold", type=float, default=DEFAULT_SUCCESS_THRESHOLD)
-    parser.add_argument("--joint-step-deg", type=float, default=DEFAULT_JOINT_STEP_DEG)
-    parser.add_argument("--medium-joint-step-deg", type=float, default=DEFAULT_MEDIUM_JOINT_STEP_DEG)
-    parser.add_argument("--near-joint-step-deg", type=float, default=DEFAULT_NEAR_JOINT_STEP_DEG)
-    parser.add_argument("--medium-step-distance", type=float, default=DEFAULT_MEDIUM_STEP_DISTANCE)
-    parser.add_argument("--near-step-distance", type=float, default=DEFAULT_NEAR_STEP_DISTANCE)
-    parser.add_argument("--adaptive-joint-step", action="store_true")
-    parser.add_argument("--ee-goal-observation", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--max-steps", type=int, default=300)
+    parser.add_argument("--seed", type=int, default=10017)
     parser.add_argument("--mode", choices=("deterministic", "stochastic", "both"), default="both")
-    return parser.parse_args()
+    add_environment_arguments(parser)
+    args, _ = parse_args_with_config(parser, sections=("environment", "evaluation"))
+    if not args.checkpoint.is_file():
+        parser.error(f"checkpoint does not exist: {args.checkpoint}")
+    return args
 
 
 def evaluate(args: argparse.Namespace, deterministic: bool) -> None:
-    env = PandaObstacleEnv(
-        randomize_reset=False,
-        success_threshold=args.success_threshold,
-        max_joint_step=np.deg2rad(args.joint_step_deg),
-        medium_joint_step=np.deg2rad(args.medium_joint_step_deg),
-        near_joint_step=np.deg2rad(args.near_joint_step_deg),
-        medium_step_distance=args.medium_step_distance,
-        near_step_distance=args.near_step_distance,
-        adaptive_joint_step=args.adaptive_joint_step,
-        include_ee_goal_observation=args.ee_goal_observation,
-        max_steps=args.max_steps,
-    )
-    agent = PPOAgent(
-        env.obs_dim,
-        env.action_dim,
-        PPOConfig(),
-        device=args.device,
-    )
+    env = make_env(args, seed=args.seed, evaluation=True)
+    agent = PPOAgent(env.obs_dim, env.action_dim, PPOConfig(), device=args.device)
     agent.load(str(args.checkpoint))
 
-    returns = []
-    successes = []
-    collisions = []
-    actions = []
+    returns: list[float] = []
+    successes: list[float] = []
+    collision_free_successes: list[float] = []
+    episode_collisions: list[float] = []
+    minimum_clearances: list[float] = []
+    actions: list[np.ndarray] = []
     try:
         for episode in range(args.episodes):
             obs = env.reset()
             done = False
             episode_return = 0.0
             step = 0
+            any_collision = False
+            min_clearance = float("inf")
             while not done:
                 action, _, _ = agent.act(obs, deterministic=deterministic)
                 obs, reward, done, info = env.step(action)
                 episode_return += reward
-                collisions.append(float(info["collision"]))
+                any_collision |= bool(info["collision"])
+                min_clearance = min(min_clearance, float(info["obstacle_clearance"]))
                 actions.append(action.copy())
                 step += 1
                 if args.render:
                     env.render()
             returns.append(episode_return)
             successes.append(float(info["success"]))
+            collision_free_successes.append(float(info["success"] and not any_collision))
+            episode_collisions.append(float(any_collision))
+            minimum_clearances.append(min_clearance)
             label = "deterministic" if deterministic else "stochastic"
             print(
-                f"mode={label} episode={episode} return={episode_return:.2f} success={info['success']} steps={step} "
-                f"target_distance={info['target_distance']:.4f} clearance={info['obstacle_clearance']:.4f} "
-                f"collision={info['collision']}"
+                f"mode={label} episode={episode} return={episode_return:.2f} "
+                f"success={info['success']} collision_free={info['success'] and not any_collision} "
+                f"steps={step} target_distance={info['target_distance']:.4f} "
+                f"min_clearance={min_clearance:.4f} any_collision={any_collision}"
             )
     finally:
         env.close()
@@ -94,8 +76,12 @@ def evaluate(args: argparse.Namespace, deterministic: bool) -> None:
     action_saturation = float(np.mean(np.abs(np.asarray(actions)) >= 0.98)) if actions else 0.0
     label = "deterministic" if deterministic else "stochastic"
     print(
-        f"summary mode={label} return={np.mean(returns):.2f} success_rate={np.mean(successes):.2f} "
-        f"collision_rate={np.mean(collisions):.3f} action_saturation_rate={action_saturation:.3f}"
+        f"summary mode={label} return={np.mean(returns):.2f} "
+        f"success_rate={np.mean(successes):.3f} "
+        f"collision_free_success_rate={np.mean(collision_free_successes):.3f} "
+        f"any_collision_rate={np.mean(episode_collisions):.3f} "
+        f"mean_min_clearance={np.mean(minimum_clearances):.4f} "
+        f"action_saturation_rate={action_saturation:.3f}"
     )
 
 
