@@ -19,7 +19,15 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from algorithms import PPOAgent, PPOConfig
-from envs import DEFAULT_SUCCESS_THRESHOLD, PandaObstacleEnv
+from envs import (
+    DEFAULT_JOINT_STEP_DEG,
+    DEFAULT_MEDIUM_JOINT_STEP_DEG,
+    DEFAULT_MEDIUM_STEP_DISTANCE,
+    DEFAULT_NEAR_JOINT_STEP_DEG,
+    DEFAULT_NEAR_STEP_DISTANCE,
+    DEFAULT_SUCCESS_THRESHOLD,
+    PandaObstacleEnv,
+)
 
 
 REWARD_FIELDS = [
@@ -38,7 +46,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-obstacles", type=int, default=0)
     parser.add_argument("--obstacle-radius", type=float, default=0.04)
     parser.add_argument("--success-threshold", type=float, default=DEFAULT_SUCCESS_THRESHOLD)
-    parser.add_argument("--joint-step-deg", type=float, default=3.0)
+    parser.add_argument("--joint-step-deg", type=float, default=DEFAULT_JOINT_STEP_DEG)
+    parser.add_argument("--medium-joint-step-deg", type=float, default=DEFAULT_MEDIUM_JOINT_STEP_DEG)
+    parser.add_argument("--near-joint-step-deg", type=float, default=DEFAULT_NEAR_JOINT_STEP_DEG)
+    parser.add_argument("--medium-step-distance", type=float, default=DEFAULT_MEDIUM_STEP_DISTANCE)
+    parser.add_argument("--near-step-distance", type=float, default=DEFAULT_NEAR_STEP_DISTANCE)
+    parser.add_argument("--adaptive-joint-step", action="store_true")
+    parser.add_argument("--ee-goal-observation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max-steps", type=int, default=300)
     parser.add_argument("--action-scale", type=float, default=1.0)
     parser.add_argument("--render", action="store_true")
@@ -56,6 +70,7 @@ def write_reward_txt(path: Path, rows: list[dict[str, float]]) -> None:
         "target_distance",
         "ee_obstacle_distance",
         "min_obstacle_distance",
+        "effective_joint_step_deg",
         "success",
         "collision",
         "timeout",
@@ -322,6 +337,12 @@ def main() -> None:
         obstacle_radius=args.obstacle_radius,
         success_threshold=args.success_threshold,
         max_joint_step=np.deg2rad(args.joint_step_deg),
+        medium_joint_step=np.deg2rad(args.medium_joint_step_deg),
+        near_joint_step=np.deg2rad(args.near_joint_step_deg),
+        medium_step_distance=args.medium_step_distance,
+        near_step_distance=args.near_step_distance,
+        adaptive_joint_step=args.adaptive_joint_step,
+        include_ee_goal_observation=args.ee_goal_observation,
         max_steps=args.max_steps,
         randomize_reset=False,
     )
@@ -362,6 +383,7 @@ def main() -> None:
                     "target_distance": float(info["target_distance"]),
                     "ee_obstacle_distance": ee_obstacle_distance,
                     "min_obstacle_distance": float(info["min_obstacle_distance"]),
+                    "effective_joint_step_deg": float(info["effective_joint_step_deg"]),
                     "success": float(info["success"]),
                     "collision": float(info["collision"]),
                     "timeout": float(info["timeout"]),

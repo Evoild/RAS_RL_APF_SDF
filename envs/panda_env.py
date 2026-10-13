@@ -13,6 +13,11 @@ except ImportError as exc:  # pragma: no cover
 
 
 DEFAULT_SUCCESS_THRESHOLD = 0.02
+DEFAULT_JOINT_STEP_DEG = 3.0
+DEFAULT_MEDIUM_JOINT_STEP_DEG = 1.0
+DEFAULT_NEAR_JOINT_STEP_DEG = 0.5
+DEFAULT_MEDIUM_STEP_DISTANCE = 0.10
+DEFAULT_NEAR_STEP_DISTANCE = 0.03
 
 
 @dataclass(frozen=True)
@@ -56,7 +61,13 @@ class PandaObstacleEnv:
         min_safety_dist: float = 0.3,
         obstacle_disturb_prob: float = 0.0,
         obstacle_disturb_step: float = 0.02,
-        max_joint_step: float = np.deg2rad(3.0),
+        max_joint_step: float = np.deg2rad(DEFAULT_JOINT_STEP_DEG),
+        medium_joint_step: float = np.deg2rad(DEFAULT_MEDIUM_JOINT_STEP_DEG),
+        near_joint_step: float = np.deg2rad(DEFAULT_NEAR_JOINT_STEP_DEG),
+        medium_step_distance: float = DEFAULT_MEDIUM_STEP_DISTANCE,
+        near_step_distance: float = DEFAULT_NEAR_STEP_DISTANCE,
+        adaptive_joint_step: bool = True,
+        include_ee_goal_observation: bool = False,
         max_steps: int = 300,
         frame_skip: int = 10,
         seed: int | None = None,
@@ -89,6 +100,19 @@ class PandaObstacleEnv:
         self.obstacle_disturb_prob = float(obstacle_disturb_prob)
         self.obstacle_disturb_step = float(obstacle_disturb_step)
         self.max_joint_step = float(max_joint_step)
+        self.medium_joint_step = float(medium_joint_step)
+        self.near_joint_step = float(near_joint_step)
+        self.medium_step_distance = float(medium_step_distance)
+        self.near_step_distance = float(near_step_distance)
+        self.adaptive_joint_step = bool(adaptive_joint_step)
+        self.include_ee_goal_observation = bool(include_ee_goal_observation)
+        joint_steps = (self.near_joint_step, self.medium_joint_step, self.max_joint_step)
+        if not all(np.isfinite(step) and step > 0.0 for step in joint_steps):
+            raise ValueError("joint step sizes must be finite positive values")
+        if not self.near_joint_step <= self.medium_joint_step <= self.max_joint_step:
+            raise ValueError("joint step sizes must satisfy near <= medium <= max")
+        if not 0.0 < self.near_step_distance < self.medium_step_distance:
+            raise ValueError("step distances must satisfy 0 < near < medium")
         self.max_steps = int(max_steps)
         self.frame_skip = int(frame_skip)
         self.randomize_reset = bool(randomize_reset)
@@ -134,8 +158,8 @@ class PandaObstacleEnv:
             shape=(self.controlled_joints,),
             dtype=np.float32,
         )
-        # State: joint_pos(7), goal_position(3), optional noisy obstacle positions.
-        obs_dim = self.controlled_joints + 3 + self.num_obstacles * 3
+        # Optional EE position and goal-relative vector expose reaching geometry directly.
+        obs_dim = self.controlled_joints + 3 + (6 if self.include_ee_goal_observation else 0) + self.num_obstacles * 3
         self.observation_space = ContinuousBoxSpace(
             low=np.full(obs_dim, -np.inf, dtype=np.float32),
             high=np.full(obs_dim, np.inf, dtype=np.float32),
@@ -158,6 +182,7 @@ class PandaObstacleEnv:
         self.obstacles = np.zeros((self.num_obstacles, 3), dtype=np.float64)
         self.initial_ee_pos = np.zeros(3, dtype=np.float64)
         self.step_count = 0
+        self.effective_joint_step = self.max_joint_step
         self.viewer = None
 
         self.reset()
@@ -165,6 +190,7 @@ class PandaObstacleEnv:
     # 重置仿真到 home 位姿，重新生成目标和路径附近障碍物，并返回初始观测。
     def reset(self) -> np.ndarray:
         self.step_count = 0
+        self.effective_joint_step = self.max_joint_step
         mujoco.mj_resetData(self.model, self.data)
 
         qpos = self.home_joint_pos.copy()
@@ -252,6 +278,7 @@ class PandaObstacleEnv:
             "distance_reward": distance_reward,
             "reward_success": reward_success,
             "timeout_penalty": timeout_penalty,
+            "effective_joint_step_deg": float(np.rad2deg(self.effective_joint_step)),
             "ground_collision": collision_info["ground_collision"],
             "self_collision": collision_info["self_collision"],
             "obstacle_collision": collision_info["obstacle_collision"],
@@ -371,17 +398,16 @@ class PandaObstacleEnv:
                 rgba=rgba,
             )
 
-    # 网络输入包含七个机械臂关节角、目标位置和可选的带噪声障碍物位置。
+    # 网络输入包含关节角、目标位置、可选的末端/相对目标位置和障碍物位置。
     def _get_obs(self) -> np.ndarray:
         obstacle_noise = self.rng.normal(0.0, self.obstacle_obs_noise_std, size=self.obstacles.shape)
         noisy_obstacles = (self.obstacles + obstacle_noise).reshape(-1)
-        obs = np.concatenate(
-            [
-                self.data.qpos[: self.controlled_joints],
-                self.goal,
-                noisy_obstacles,
-            ]
-        )
+        parts = [self.data.qpos[: self.controlled_joints], self.goal]
+        if self.include_ee_goal_observation:
+            ee_pos = self._ee_pos()
+            parts.extend((ee_pos, self.goal - ee_pos))
+        parts.append(noisy_obstacles)
+        obs = np.concatenate(parts)
 
         if obs.shape != self.observation_space.shape:
             raise RuntimeError(f"Observation shape drifted to {obs.shape}, expected {self.observation_space.shape}")
@@ -399,9 +425,20 @@ class PandaObstacleEnv:
         distance_reward = -self.distance_reward_scale * distance_to_goal
         return distance_reward, distance_to_goal, min_obstacle_distance, collision_info
 
-    # 将归一化动作映射成受关节限位约束的小步位置目标。
+    def _select_joint_step(self) -> float:
+        if not self.adaptive_joint_step:
+            return self.max_joint_step
+        distance_to_goal = float(np.linalg.norm(self._ee_pos() - self.goal))
+        if distance_to_goal < self.near_step_distance:
+            return self.near_joint_step
+        if distance_to_goal < self.medium_step_distance:
+            return self.medium_joint_step
+        return self.max_joint_step
+
+    # 接近目标后自动缩小关节增量，避免固定大步长越过成功区域。
     def _joint_action_to_target(self, action: np.ndarray) -> np.ndarray:
-        joint_target = self.data.qpos[: self.controlled_joints] + action * self.max_joint_step
+        self.effective_joint_step = self._select_joint_step()
+        joint_target = self.data.qpos[: self.controlled_joints] + action * self.effective_joint_step
         joint_low = self.model.jnt_range[: self.controlled_joints, 0]
         joint_high = self.model.jnt_range[: self.controlled_joints, 1]
         return np.clip(joint_target, joint_low, joint_high)

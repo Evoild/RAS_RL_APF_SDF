@@ -21,9 +21,11 @@ class PPOConfig:
     value_lr: float = 2e-4
     train_epochs: int = 10
     minibatch_size: int = 2048
+    target_kl: float | None = 0.02
     entropy_coef: float = 0.0
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
+    separate_grad_clip: bool = False
     actor_hidden_sizes: tuple[int, ...] = (256, 128)
     critic_hidden_sizes: tuple[int, ...] = (256, 128)
     log_std_init: float = -0.7
@@ -167,9 +169,22 @@ class PPOAgent:
         advantages_t = torch.as_tensor(advantages, dtype=torch.float32, device=self.device)
 
         indices = np.arange(len(buffer))
-        metrics = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "approx_kl": 0.0, "clip_fraction": 0.0}
+        metrics = {
+            "policy_loss": 0.0,
+            "value_loss": 0.0,
+            "entropy": 0.0,
+            "approx_kl": 0.0,
+            "clip_fraction": 0.0,
+            "actor_grad_norm": 0.0,
+            "critic_grad_norm": 0.0,
+        }
+        actor_params = list(self.model.actor_mean.parameters()) + [self.model.log_std]
+        critic_params = list(self.model.critic.parameters())
         updates = 0
-        for _ in range(cfg.train_epochs):
+        epochs_used = 0
+        max_approx_kl = 0.0
+        kl_early_stop = False
+        for epoch in range(cfg.train_epochs):
             np.random.shuffle(indices)
             for start in range(0, len(indices), cfg.minibatch_size):
                 batch = indices[start : start + cfg.minibatch_size]
@@ -192,10 +207,21 @@ class PPOAgent:
                 with torch.no_grad():
                     approx_kl = ((ratio - 1.0) - log_ratio).mean()
                     clip_fraction = (torch.abs(ratio - 1.0) > cfg.clip_ratio).float().mean()
+                approx_kl_value = float(approx_kl.item())
+                max_approx_kl = max(max_approx_kl, approx_kl_value)
+                if cfg.target_kl is not None and approx_kl_value > cfg.target_kl:
+                    kl_early_stop = True
+                    break
 
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.model.parameters(), cfg.max_grad_norm)
+                actor_grad_norm = self._grad_norm(actor_params)
+                critic_grad_norm = self._grad_norm(critic_params)
+                if cfg.separate_grad_clip:
+                    nn.utils.clip_grad_norm_(actor_params, cfg.max_grad_norm)
+                    nn.utils.clip_grad_norm_(critic_params, cfg.max_grad_norm)
+                else:
+                    nn.utils.clip_grad_norm_(self.model.parameters(), cfg.max_grad_norm)
                 self.optimizer.step()
                 with torch.no_grad():
                     self.model.log_std.clamp_(cfg.log_std_min, cfg.log_std_max)
@@ -203,13 +229,27 @@ class PPOAgent:
                 metrics["policy_loss"] += float(policy_loss.item())
                 metrics["value_loss"] += float(value_loss.item())
                 metrics["entropy"] += float(entropy.item())
-                metrics["approx_kl"] += float(approx_kl.item())
+                metrics["approx_kl"] += approx_kl_value
                 metrics["clip_fraction"] += float(clip_fraction.item())
+                metrics["actor_grad_norm"] += actor_grad_norm
+                metrics["critic_grad_norm"] += critic_grad_norm
                 updates += 1
+                epochs_used = epoch + 1
+
+            if kl_early_stop:
+                break
 
         for key in metrics:
             metrics[key] /= max(updates, 1)
+        metrics["max_approx_kl"] = max_approx_kl
+        metrics["update_epochs"] = float(epochs_used)
+        metrics["kl_early_stop"] = float(kl_early_stop)
         return metrics
+
+    @staticmethod
+    def _grad_norm(parameters: list[nn.Parameter]) -> float:
+        norms = [torch.linalg.vector_norm(param.grad.detach()) for param in parameters if param.grad is not None]
+        return float(torch.linalg.vector_norm(torch.stack(norms)).item()) if norms else 0.0
 
     @staticmethod
     def _atanh(action: torch.Tensor) -> torch.Tensor:

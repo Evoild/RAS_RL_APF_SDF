@@ -23,13 +23,26 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from algorithms import PPOAgent, PPOConfig, RolloutBuffer
-from envs import DEFAULT_SUCCESS_THRESHOLD, PandaObstacleEnv
+from envs import (
+    DEFAULT_JOINT_STEP_DEG,
+    DEFAULT_MEDIUM_JOINT_STEP_DEG,
+    DEFAULT_MEDIUM_STEP_DISTANCE,
+    DEFAULT_NEAR_JOINT_STEP_DEG,
+    DEFAULT_NEAR_STEP_DISTANCE,
+    DEFAULT_SUCCESS_THRESHOLD,
+    PandaObstacleEnv,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PPO for seven-joint Panda reaching and obstacle avoidance.")
-    parser.add_argument("--total-steps", type=int, default=40_000_000)
+    parser.add_argument("--total-steps", type=int, default=4_000_000)
     parser.add_argument("--rollout-steps", type=int, default=2048)
+    parser.add_argument("--policy-lr", type=float, default=2e-4)
+    parser.add_argument("--value-lr", type=float, default=2e-4)
+    parser.add_argument("--train-epochs", type=int, default=10)
+    parser.add_argument("--target-kl", type=float, default=0.02)
+    parser.add_argument("--separate-grad-clip", action="store_true")
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints_ppo"))
@@ -44,7 +57,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-obstacles", type=int, default=0)
     parser.add_argument("--obstacle-radius", type=float, default=0.04)
     parser.add_argument("--success-threshold", type=float, default=DEFAULT_SUCCESS_THRESHOLD)
-    parser.add_argument("--joint-step-deg", type=float, default=3.0)
+    parser.add_argument("--joint-step-deg", type=float, default=DEFAULT_JOINT_STEP_DEG)
+    parser.add_argument("--medium-joint-step-deg", type=float, default=DEFAULT_MEDIUM_JOINT_STEP_DEG)
+    parser.add_argument("--near-joint-step-deg", type=float, default=DEFAULT_NEAR_JOINT_STEP_DEG)
+    parser.add_argument("--medium-step-distance", type=float, default=DEFAULT_MEDIUM_STEP_DISTANCE)
+    parser.add_argument("--near-step-distance", type=float, default=DEFAULT_NEAR_STEP_DISTANCE)
+    parser.add_argument("--adaptive-joint-step", action="store_true")
+    parser.add_argument("--ee-goal-observation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max-steps", type=int, default=300)
     parser.add_argument("--randomize-reset", action="store_true")
     return parser.parse_args()
@@ -56,6 +75,12 @@ def make_env(args: argparse.Namespace) -> PandaObstacleEnv:
         obstacle_radius=args.obstacle_radius,
         success_threshold=args.success_threshold,
         max_joint_step=np.deg2rad(args.joint_step_deg),
+        medium_joint_step=np.deg2rad(args.medium_joint_step_deg),
+        near_joint_step=np.deg2rad(args.near_joint_step_deg),
+        medium_step_distance=args.medium_step_distance,
+        near_step_distance=args.near_step_distance,
+        adaptive_joint_step=args.adaptive_joint_step,
+        include_ee_goal_observation=args.ee_goal_observation,
         max_steps=args.max_steps,
         randomize_reset=args.randomize_reset,
         seed=args.seed,
@@ -69,6 +94,12 @@ def make_eval_env(args: argparse.Namespace) -> PandaObstacleEnv:
         obstacle_radius=args.obstacle_radius,
         success_threshold=args.success_threshold,
         max_joint_step=np.deg2rad(args.joint_step_deg),
+        medium_joint_step=np.deg2rad(args.medium_joint_step_deg),
+        near_joint_step=np.deg2rad(args.near_joint_step_deg),
+        medium_step_distance=args.medium_step_distance,
+        near_step_distance=args.near_step_distance,
+        adaptive_joint_step=args.adaptive_joint_step,
+        include_ee_goal_observation=args.ee_goal_observation,
         max_steps=args.max_steps,
         randomize_reset=False,
         seed=eval_seed,
@@ -77,10 +108,30 @@ def make_eval_env(args: argparse.Namespace) -> PandaObstacleEnv:
 
 def base_run_name(args: argparse.Namespace) -> str:
     success_threshold = format(args.success_threshold, ".6g")
+    joint_steps = "-".join(
+        format(value, ".6g")
+        for value in (args.joint_step_deg, args.medium_joint_step_deg, args.near_joint_step_deg)
+    )
+    step_distances = "-".join(
+        format(value, ".6g") for value in (args.medium_step_distance, args.near_step_distance)
+    )
+    policy_lr = format(args.policy_lr, ".6g")
+    target_kl = format(args.target_kl, ".6g")
+    joint_step_mode = "adaptive" if args.adaptive_joint_step else "fixed"
+    grad_clip_mode = "separate" if args.separate_grad_clip else "shared"
+    observation_mode = "ee-goal-16d" if args.ee_goal_observation else "legacy-10d"
     return (
         f"total-steps_{args.total_steps}"
         f"_rollout-steps_{args.rollout_steps}"
         f"_success-threshold_{success_threshold}"
+        f"_joint-steps-deg_{joint_steps}"
+        f"_step-distances_{step_distances}"
+        f"_joint-step-mode_{joint_step_mode}"
+        f"_grad-clip_{grad_clip_mode}"
+        f"_observation_{observation_mode}"
+        f"_policy-lr_{policy_lr}"
+        f"_epochs_{args.train_epochs}"
+        f"_target-kl_{target_kl}"
         f"_seed_{args.seed}"
     )
 
@@ -136,8 +187,20 @@ def write_tensorboard(
             "obstacle_collision_rate",
             "target_distance",
             "min_obstacle_distance",
+            "mean_joint_step_deg",
         ],
-        "ppo": ["policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction"],
+        "ppo": [
+            "policy_loss",
+            "value_loss",
+            "entropy",
+            "approx_kl",
+            "max_approx_kl",
+            "clip_fraction",
+            "update_epochs",
+            "kl_early_stop",
+            "actor_grad_norm",
+            "critic_grad_norm",
+        ],
         "policy": ["action_saturation_rate", "policy_std_mean"],
     }
     for group, fields in scalar_groups.items():
@@ -253,7 +316,13 @@ def main() -> None:
 
     run_name, tensorboard_dir, checkpoint_run_dir = resolve_run_dirs(args)
     env = make_env(args)
-    cfg = PPOConfig()
+    cfg = PPOConfig(
+        policy_lr=args.policy_lr,
+        value_lr=args.value_lr,
+        train_epochs=args.train_epochs,
+        target_kl=args.target_kl,
+        separate_grad_clip=args.separate_grad_clip,
+    )
     agent = PPOAgent(
         env.obs_dim,
         env.action_dim,
@@ -280,11 +349,17 @@ def main() -> None:
         "obstacle_collision_rate",
         "target_distance",
         "min_obstacle_distance",
+        "mean_joint_step_deg",
         "policy_loss",
         "value_loss",
         "entropy",
         "approx_kl",
+        "max_approx_kl",
         "clip_fraction",
+        "update_epochs",
+        "kl_early_stop",
+        "actor_grad_norm",
+        "critic_grad_norm",
         "action_saturation_rate",
         "policy_std_mean",
     ]
@@ -322,6 +397,7 @@ def main() -> None:
             rollout_self_collisions: list[float] = []
             rollout_obstacle_collisions: list[float] = []
             rollout_actions: list[np.ndarray] = []
+            rollout_joint_steps: list[float] = []
 
             for _ in range(args.rollout_steps):
                 action, log_prob, value = agent.act(obs)
@@ -335,6 +411,7 @@ def main() -> None:
                 rollout_ground_collisions.append(float(info.get("ground_collision", False)))
                 rollout_self_collisions.append(float(info.get("self_collision", False)))
                 rollout_obstacle_collisions.append(float(info.get("obstacle_collision", False)))
+                rollout_joint_steps.append(float(info["effective_joint_step_deg"]))
 
                 if done:
                     rollout_returns.append(episode_return)
@@ -378,6 +455,7 @@ def main() -> None:
                 "obstacle_collision_rate": mean_obstacle_collision,
                 "target_distance": float(info["target_distance"]),
                 "min_obstacle_distance": float(info["min_obstacle_distance"]),
+                "mean_joint_step_deg": float(np.mean(rollout_joint_steps)),
                 "action_saturation_rate": action_saturation_rate(rollout_actions),
                 "policy_std_mean": policy_std_mean(agent),
                 **metrics,
